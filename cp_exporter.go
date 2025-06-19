@@ -128,16 +128,13 @@ func updateMetrics(certs []CertInfo) {
 	}
 }
 
-func main() {
-	users := flag.String("users", "nginx", "User")
-	port := flag.Int("port", 9105, "TCP port")
-	flag.Parse()
+func updateAllMetrics(users []string) {
+	var outputs string
 
-	outputs := ""
-	usersSlice := strings.Split(*users, ",")
-	for _, user := range usersSlice {
+	for _, user := range users {
 		output, err := runCertmgr(user)
 		if err != nil {
+			log.Printf("Error running certmgr for user %s: %v", user, err)
 			continue
 		}
 
@@ -152,12 +149,32 @@ func main() {
 		}
 		output = strings.Join(result, "\n")
 
-		outputs += output
+		outputs += output + "\n"
 	}
 
 	certs := parseCertOutput(outputs)
 	updateMetrics(certs)
+}
 
+func main() {
+	users := flag.String("users", "nginx", "User")
+	port := flag.Int("port", 9105, "TCP port")
+	interval := flag.Int("interval", 60, "Update interval in seconds")
+	flag.Parse()
+
+	usersSlice := strings.Split(*users, ",")
+
+	go func() {
+		ticker := time.NewTicker(time.Duration(*interval) * time.Second)
+		defer ticker.Stop()
+
+		for {
+			updateAllMetrics(usersSlice)
+			<-ticker.C
+		}
+	}()
+
+	updateAllMetrics(usersSlice)
 
 	http.Handle("/metrics", promhttp.Handler())
 	log.Println("Exporter listening on :" + strconv.Itoa(*port) + "/metrics\nUsers : " + *users)
