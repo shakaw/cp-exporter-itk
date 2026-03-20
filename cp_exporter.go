@@ -1,31 +1,35 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"log"
-	"os/exec"
-	"regexp"
-	"strings"
-	"strconv"
-	"time"
 	"net/http"
-	"flag"
+	"os"
+	"os/exec"
+	"os/signal"
+	"regexp"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type CertInfo struct {
-	IssuerINN         string
-	User              string
-	Serial            string
-	NotBefore         string
-	NotAfter          string
-	Thumbprint        string
-	SignatureAlgo     string
-	PrivateKeyLink    string
-	Container         string
-	NotValidAfter     time.Time
+	IssuerINN      string
+	User           string
+	Serial         string
+	NotBefore      string
+	NotAfter       string
+	Thumbprint     string
+	SignatureAlgo  string
+	PrivateKeyLink string
+	Container      string
+	NotValidAfter  time.Time
 }
 
 var (
@@ -42,22 +46,32 @@ func init() {
 	prometheus.MustRegister(certExpiration)
 }
 
+var (
+	reSeparator = regexp.MustCompile(`^\d+-+$`)
+	reIssuer    = regexp.MustCompile(`Issuer\s*:\s*(.+)`)
+	reIssuerINN = regexp.MustCompile(`ИНН( ЮЛ)?=([0-9]+)`)
+
+	reUser         = regexp.MustCompile(`^User\s*:\s*(.+)$`)
+	reSerial       = regexp.MustCompile(`^Serial\s*:\s*(.+)$`)
+	reThumbprint   = regexp.MustCompile(`^SHA1 Thumbprint\s*:\s*(.+)$`)
+	reSigAlgo      = regexp.MustCompile(`^Signature Algorithm\s*:\s*(.+)$`)
+	rePrivateKey   = regexp.MustCompile(`^PrivateKey Link\s*:\s*(.+)$`)
+	reContainer    = regexp.MustCompile(`^Container\s*:\s*(.+)$`)
+	reNotBefore    = regexp.MustCompile(`^Not valid before\s*:\s*(.+)$`)
+	reNotAfter     = regexp.MustCompile(`^Not valid after\s*:\s*(.+)$`)
+)
+
 func parseCertOutput(output string) []CertInfo {
 	var certs []CertInfo
 	var current CertInfo
 	lines := strings.Split(output, "\n")
 
 	dateLayout := "02/01/2006 15:04:05 MST"
-	reIssuer := regexp.MustCompile(`Issuer\s*:\s*(.+)`)
-	reIssuerINN := regexp.MustCompile(`ИНН( ЮЛ)?=([0-9]+)`)
-	reField := func(name string) *regexp.Regexp {
-		return regexp.MustCompile(fmt.Sprintf(`^%s\s*:\s*(.+)$`, regexp.QuoteMeta(name)))
-	}
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 
-		if matched, _ := regexp.MatchString(`^\d+-+$`, line); matched {
+		if reSeparator.MatchString(line) {
 			if current.Thumbprint != "" {
 				certs = append(certs, current)
 				current = CertInfo{}
@@ -69,21 +83,21 @@ func parseCertOutput(output string) []CertInfo {
 			if inn := reIssuerINN.FindStringSubmatch(m[1]); len(inn) > 2 {
 				current.IssuerINN = inn[2]
 			}
-		} else if m := reField("User").FindStringSubmatch(line); len(m) == 2 {
+		} else if m := reUser.FindStringSubmatch(line); len(m) == 2 {
 			current.User = m[1]
-		} else if m := reField("Serial").FindStringSubmatch(line); len(m) == 2 {
+		} else if m := reSerial.FindStringSubmatch(line); len(m) == 2 {
 			current.Serial = m[1]
-		} else if m := reField("SHA1 Thumbprint").FindStringSubmatch(line); len(m) == 2 {
+		} else if m := reThumbprint.FindStringSubmatch(line); len(m) == 2 {
 			current.Thumbprint = m[1]
-		} else if m := reField("Signature Algorithm").FindStringSubmatch(line); len(m) == 2 {
+		} else if m := reSigAlgo.FindStringSubmatch(line); len(m) == 2 {
 			current.SignatureAlgo = m[1]
-		} else if m := reField("PrivateKey Link").FindStringSubmatch(line); len(m) == 2 {
+		} else if m := rePrivateKey.FindStringSubmatch(line); len(m) == 2 {
 			current.PrivateKeyLink = m[1]
-		} else if m := reField("Container").FindStringSubmatch(line); len(m) == 2 {
+		} else if m := reContainer.FindStringSubmatch(line); len(m) == 2 {
 			current.Container = m[1]
-		} else if m := reField("Not valid before").FindStringSubmatch(line); len(m) == 2 {
+		} else if m := reNotBefore.FindStringSubmatch(line); len(m) == 2 {
 			current.NotBefore = m[1]
-		} else if m := reField("Not valid after").FindStringSubmatch(line); len(m) == 2 {
+		} else if m := reNotAfter.FindStringSubmatch(line); len(m) == 2 {
 			current.NotAfter = m[1]
 			t, err := time.Parse(dateLayout, strings.TrimSpace(m[1]))
 			if err == nil {
@@ -98,21 +112,21 @@ func parseCertOutput(output string) []CertInfo {
 	return certs
 }
 
-func runCertmgr(user string) (string, error) {
-	cmd := exec.Command("sudo", "-u", user, "/opt/cprocsp/bin/amd64/certmgr", "-list")
+func runCertmgr(user, certmgrPath string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sudo", "-u", user, certmgrPath, "-list")
 	out, err := cmd.CombinedOutput()
-	return string(out), err
-}
-
-func subTimeAbs(later, earlier time.Time) time.Duration {
-    diff := later.Sub(earlier)
-    return diff
+	if err != nil {
+		return string(out), fmt.Errorf("%w; output: %s", err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
 }
 
 func updateMetrics(certs []CertInfo) {
-	now := time.Now()
+	certExpiration.Reset()
 	for _, cert := range certs {
-		secondsLeft := subTimeAbs(cert.NotValidAfter, now).Seconds()
+		secondsLeft := time.Until(cert.NotValidAfter).Seconds()
 
 		certExpiration.WithLabelValues(
 			cert.IssuerINN,
@@ -128,14 +142,16 @@ func updateMetrics(certs []CertInfo) {
 	}
 }
 
-func updateAllMetrics(users []string) {
+func updateAllMetrics(users []string, certmgrPath string) {
 	var outputs string
 
 	for _, user := range users {
-		output, err := runCertmgr(user)
+		output, err := runCertmgr(user, certmgrPath)
 		if err != nil {
 			log.Printf("Error running certmgr for user %s: %v", user, err)
-			continue
+			if output == "" {
+				continue
+			}
 		}
 
 		lines := strings.Split(output, "\n")
@@ -144,7 +160,7 @@ func updateAllMetrics(users []string) {
 		for _, line := range lines {
 			result = append(result, line)
 			if strings.HasPrefix(line, "Issuer              :") {
-				result = append(result, "User              : " + user)
+				result = append(result, "User              : "+user)
 			}
 		}
 		output = strings.Join(result, "\n")
@@ -157,28 +173,50 @@ func updateAllMetrics(users []string) {
 }
 
 func main() {
-	users := flag.String("users", "nginx", "User")
+	users := flag.String("users", "nginx", "Comma-separated list of users")
 	port := flag.Int("port", 9105, "TCP port")
 	interval := flag.Int("interval", 60, "Update interval in seconds")
+	certmgrPath := flag.String("certmgr", "/opt/cprocsp/bin/amd64/certmgr", "Path to certmgr binary")
 	flag.Parse()
 
+	if *port < 1 || *port > 65535 {
+		log.Fatalf("Invalid port: %d", *port)
+	}
+
 	usersSlice := strings.Split(*users, ",")
+
+	updateAllMetrics(usersSlice, *certmgrPath)
 
 	go func() {
 		ticker := time.NewTicker(time.Duration(*interval) * time.Second)
 		defer ticker.Stop()
-
-		for {
-			updateAllMetrics(usersSlice)
-			<-ticker.C
+		for range ticker.C {
+			updateAllMetrics(usersSlice, *certmgrPath)
 		}
 	}()
 
-	updateAllMetrics(usersSlice)
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
 
-	http.Handle("/metrics", promhttp.Handler())
-	log.Println("Exporter listening on :" + strconv.Itoa(*port) + "/metrics\nUsers : " + *users)
-	log.Fatal(http.ListenAndServe(":" + strconv.Itoa(*port), nil))
+	srv := &http.Server{
+		Addr:    ":" + strconv.Itoa(*port),
+		Handler: mux,
+	}
 
+	go func() {
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+		<-quit
+		log.Println("Shutting down...")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("HTTP server shutdown error: %v", err)
+		}
+	}()
+
+	log.Printf("Exporter listening on :%d/metrics, users: %s", *port, *users)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("HTTP server error: %v", err)
+	}
 }
-
